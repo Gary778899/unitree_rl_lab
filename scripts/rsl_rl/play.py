@@ -8,9 +8,10 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-from importlib.metadata import version
+import importlib.metadata as metadata
 
 from isaaclab.app import AppLauncher
+from packaging import version
 
 # local imports
 import cli_args  # isort: skip
@@ -30,6 +31,18 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--print_debug_stats",
+    action="store_true",
+    default=False,
+    help="Print command/action/velocity debug stats during play.",
+)
+parser.add_argument(
+    "--debug_stats_interval",
+    type=int,
+    default=200,
+    help="Step interval for debug stats printing during play.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -56,8 +69,14 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg,
+    RslRlVecEnvWrapper,
+    export_policy_as_jit,
+    export_policy_as_onnx,
+    handle_deprecated_rsl_rl_cfg,
+)
 from isaaclab_tasks.utils import get_checkpoint_path
 
 import unitree_rl_lab.tasks  # noqa: F401
@@ -66,6 +85,8 @@ from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 def main():
     """Play with RSL-RL agent."""
+    installed_version = metadata.version("rsl-rl-lib")
+
     # parse configuration
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -114,6 +135,9 @@ def main():
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
+    # normalize deprecated/new rsl-rl model config fields for installed rsl-rl version
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     if not hasattr(agent_cfg, "class_name") or agent_cfg.class_name == "OnPolicyRunner":
@@ -129,34 +153,41 @@ def main():
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
-
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
-
-    # export policy to onnx/jit
+    # export the trained policy to JIT and ONNX formats
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+
+    if version.parse(installed_version) >= version.parse("4.0.0"):
+        # use the new export functions for rsl-rl >= 4.0.0
+        runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
+        runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+        policy_nn = None
+    else:
+        # extract the neural network for rsl-rl < 4.0.0
+        if version.parse(installed_version) >= version.parse("2.3.0"):
+            policy_nn = getattr(runner.alg, "policy", None)
+        else:
+            policy_nn = getattr(runner.alg, "actor_critic", None)
+        if policy_nn is None:
+            raise AttributeError(
+                f"Unable to resolve policy network for rsl-rl version {installed_version} from runner algorithm."
+            )
+
+        # extract the normalizer
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
+
+        # export to JIT and ONNX
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
     # reset environment
     obs = env.get_observations()
-    if version("rsl-rl-lib").startswith("2.3."):
-        obs, _ = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -166,12 +197,36 @@ def main():
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, _, _ = env.step(actions)
+            obs, _, dones, _ = env.step(actions)
+            # reset recurrent states for episodes that have terminated
+            if version.parse(installed_version) >= version.parse("4.0.0"):
+                policy.reset(dones)
+            elif policy_nn is not None:
+                policy_nn.reset(dones)
+
+            if args_cli.print_debug_stats and (timestep % max(args_cli.debug_stats_interval, 1) == 0):
+                try:
+                    command = env.unwrapped.command_manager.get_command("base_velocity")
+                    cmd0 = command[0].detach().cpu().tolist()
+                except Exception:
+                    cmd0 = None
+                try:
+                    base_lin_vel_b = env.unwrapped.scene["robot"].data.root_lin_vel_b
+                    vel0 = base_lin_vel_b[0, :3].detach().cpu().tolist()
+                except Exception:
+                    vel0 = None
+                try:
+                    act_norm = actions[0].detach().norm().item()
+                except Exception:
+                    act_norm = None
+                print(f"[DEBUG][play] step={timestep} cmd0={cmd0} base_lin_vel_b0={vel0} action_norm0={act_norm}")
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        else:
+            timestep += 1
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
