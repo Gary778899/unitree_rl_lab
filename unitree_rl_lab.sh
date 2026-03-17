@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 
+# Get the absolute path of the repository
 export UNITREE_RL_LAB_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
-if ! [[ -z "${CONDA_PREFIX}" ]]; then
-    python_exe=${CONDA_PREFIX}/bin/python
+# Detect Python via uv
+if command -v uv &> /dev/null; then
+    # Use 'uv run python' to ensure it uses the project's virtualenv
+    python_exe="uv run --active python"
 else
-    echo "[Error] No conda environment activated. Please activate the conda environment first."
-    # exit 1
+    echo "[Error] 'uv' is not installed or not in PATH. Please install uv first."
+    exit 1
 fi
 
-
-# task env name autocomplete
+# task env name autocomplete (Updated for uv)
 _ut_rl_lab_python_argcomplete_wrapper() {
     local IFS=$'\013'
     local SUPPRESS_SPACE=0
@@ -28,43 +30,25 @@ _ut_rl_lab_python_argcomplete_wrapper() {
 }
 complete -o nospace -F _ut_rl_lab_python_argcomplete_wrapper "./unitree_rl_lab.sh"
 
-
-_ut_setup_conda_env() {
-
-    # copied from isaaclab/_isaac_sim/setup_conda_env.sh
-    # add source unitree_rl_lab.sh to conda activate.d
-    printf '%s\n' '#!/usr/bin/env bash' '' \
-        '# for Isaac Lab' \
-        'export ISAACLAB_PATH='${ISAACLAB_PATH}'' \
-        'alias isaaclab='${ISAACLAB_PATH}'/isaaclab.sh' \
-        '' \
-        '# show icon if not running headless' \
-        'export RESOURCE_NAME="IsaacSim"' \
-        '' \
-        '# for unitree_rl_lab' \
-        'source '${UNITREE_RL_LAB_PATH}'/unitree_rl_lab.sh' \
-        '' > ${CONDA_PREFIX}/etc/conda/activate.d/setenv.sh
-
-    # check if we have _isaac_sim directory -> if so that means binaries were installed.
-    # we need to setup conda variables to load the binaries
-    local isaacsim_setup_conda_env_script=${ISAACLAB_PATH}/_isaac_sim/setup_conda_env.sh
-
-    if [ -f "${isaacsim_setup_conda_env_script}" ]; then
-        # add variables to environment during activation
-        printf '%s\n' \
-            '# for Isaac Sim' \
-            'source '${isaacsim_setup_conda_env_script}'' \
-            '' >> ${CONDA_PREFIX}/etc/conda/activate.d/setenv.sh
-    fi
+_ut_setup_uv_env() {
+    echo "[Info] Setting up environment variables..."
+    
+    # Since uv doesn't use 'activate.d', we create a local env file 
+    # that you can source, or just export them now.
+    export ISAACLAB_PATH="${ISAACLAB_PATH:-$HOME/IsaacLab}" # Adjust if your IsaacLab path is different
+    
+    echo "To use this environment in the future, ensure ISAACLAB_PATH is set."
+    echo "Current ISAACLAB_PATH: $ISAACLAB_PATH"
 }
 
 # pass the arguments
 case "$1" in
     -i|--install)
-        git lfs install # ensure git lfs is installed
-        pip install -e ${UNITREE_RL_LAB_PATH}/source/unitree_rl_lab/
-        _ut_setup_conda_env
-        activate-global-python-argcomplete
+        echo "[Info] Installing unitree_rl_lab using uv..."
+        git lfs install
+        # Install in editable mode using uv
+        uv pip install -e "${UNITREE_RL_LAB_PATH}/source/unitree_rl_lab/"
+        _ut_setup_uv_env
         ;;
     -l|--list)
         shift
@@ -78,6 +62,7 @@ case "$1" in
         shift
         ${python_exe} ${UNITREE_RL_LAB_PATH}/scripts/rsl_rl/train.py --headless "$@"
         ;;
-    *) # unknown option
+    *)
+        echo "Usage: $0 {-i|--install|-l|--list|-p|--play|-t|--train}"
         ;;
 esac
